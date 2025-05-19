@@ -172,16 +172,16 @@ class WaveformHitFinder(H5FlowStage):
 
     def get_noise_threshold(self, wvfms, n_mad_factor):
         # Initialize median and MAD
-        median = np.ma.median(wvfms, axis=-1)
-        mad = np.ma.median(np.abs(wvfms - median[..., np.newaxis]), axis=-1)
+        median = np.ma.median(wvfms, axis=(0,-1))
+        mad = np.ma.median(np.abs(wvfms - median[..., np.newaxis]), axis=(0,-1))
         # identify outliers in the waveform
         mad_factor = n_mad_factor * mad
         noise_mask = np.abs(wvfms - median[..., np.newaxis]) < mad_factor[..., np.newaxis]
         # set non mask values to nan
         noise_samples = np.where(noise_mask, wvfms, np.nan)
         # calculate noise as stddev of noise_samples
-        noise = np.where(np.nansum(noise_samples, axis=-1) != 0,
-                         np.nanstd(noise_samples, axis=-1),
+        noise = np.where(np.nansum(noise_samples, axis=(0,-1)) != 0,
+                         np.nanstd(noise_samples, axis=(0,-1)),
                          np.nan)
         return  noise
 
