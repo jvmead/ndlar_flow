@@ -72,8 +72,6 @@ class FlashFinder(H5FlowStage):
         super(FlashFinder, self).init(source_name)
 
         cwvfm_dset = self.data_manager.get_dset(self.cwvfm_dset_name)
-        self.sum_hits_dset = self.data_manager.get_dset(self.sum_hits_dset_name)
-        self.sipm_hits_dset = self.data_manager.get_dset(self.sipm_hits_dset_name)
         self.input_hits_dset = self.data_manager.get_dset(self.input_hits_dset_name)
 
         self.dbs = cluster.DBSCAN(eps=self.eps, min_samples=self.min_samples)
@@ -97,9 +95,7 @@ class FlashFinder(H5FlowStage):
         self.data_manager.set_attrs(self.flash_dset_name,
                                     classname=self.classname,
                                     class_version=self.class_version,
-                                    input_hits_dset=self.input_hits_dset_name,
-                                    sum_hits_dset=self.sum_hits_dset_name,
-                                    sipm_hits_dset=self.sipm_hits_dset_name
+                                    input_hits_dset=self.input_hits_dset_name
                                     )
 
     def get_tpc_channels(self,itpc):
