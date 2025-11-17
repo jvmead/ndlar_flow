@@ -146,10 +146,21 @@ class FlashFinder(H5FlowStage):
 
         for i, ev in enumerate(events):
             if VERBOSE: print("Event #",i)
+            # figure out per-hit TPC index depending on input hit dtype
+            names = input_hits[i,:].dtype.names
+            has_tpc_field = ('tpc' in names)
+            if has_tpc_field:
+                hit_tpcs = input_hits[i,:]['tpc']
+            else:
+                # sipm hits: derive TPC from adc/chan via rel_pos_map[...,0]
+                adc = input_hits[i,:]['adc'].astype(int)
+                chan = input_hits[i,:]['chan'].astype(int)
+                hit_tpcs = self.rel_pos_map[adc, chan, 0].astype(int)
+
             for itpc in range(self.ntpc):
-                tpc_mask = (input_hits[i,:]["tpc"] == itpc)
-                tpc_hits = input_hits[i,tpc_mask]
-                tpc_hits_idx = input_hits_idx[i,tpc_mask]
+                tpc_mask = (hit_tpcs == itpc)
+                tpc_hits = input_hits[i, tpc_mask]
+                tpc_hits_idx = input_hits_idx[i, tpc_mask]
                 if np.any(tpc_mask):
                     labels = self.dbs.fit_predict(tpc_hits["sample_idx"].reshape(-1,1)) # single feature
 
