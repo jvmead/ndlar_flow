@@ -11,7 +11,10 @@ params:
   sipm_hits_dset_name: 'light/sipm_hits'
   sum_hits_dset_name: 'light/sum_hits'
   stpc_wvfm_dset_name: 'light/stpc_wvfm'
-  
+
+  # Configurable input for clustering (defaults to sum_hits for backward compatibility)
+  input_hits_dset_name: 'light/sum_hits'
+
   eps: 10
   min_samples: 1  # >1 not supported in current implemenation
   nchantpc: 48

@@ -15,8 +15,8 @@ class FlashFinder(H5FlowStage):
     '''
         ('id', 'u4'),                           Unique flash ID
         ('tpc', 'u1'),                          TPC ID (0-7)
-        ('n_sum_hits', 'u4'),                   Number of sum hits associated
-        ('sample_range', 'u2', (2,)),           Min and Max sample index of sum hits
+        ('n_hits', 'u4'),                       Number of hits associated
+        ('sample_range', 'u2', (2,)),           Min and Max sample index of hits
         ('hit_time_range', 'f4', (2,))          Min and Max timestamp of hit center relative to trigger time in ns (see busy_ns in hit definition)
         ('rising_spline_range', 'f4', (2,))     Min and Max timestamp of rising spline projections relative to trigger time in ns (see rising_spline in hit definition)
         ('tot_sum', 'f4'),                      Sum over hit sum values
@@ -27,7 +27,7 @@ class FlashFinder(H5FlowStage):
         ('deconv_max', 'f4', (2,nchantpc//2))   Max over flash range for each channel of the TPC (side,vert_pos)
 
     '''
-    class_version = '1.0.0'
+    class_version = '1.1.0'
 
     flash_dset_name = 'light/flash'
 
@@ -36,6 +36,7 @@ class FlashFinder(H5FlowStage):
         sipm_hits_dset_name = 'light/sipm_hits',
         sum_hits_dset_name = 'light/sum_hits',
         flash_dset_name = 'light/flash',
+        input_hits_dset_name = 'light/sum_hits',  # can be 'light/sum_hits' or 'light/sipm_hits'
         eps = 5,
         min_samples = 1,
         nchantpc = 48
@@ -45,7 +46,7 @@ class FlashFinder(H5FlowStage):
         return np.dtype([
             ('id', 'u4'),
             ('tpc', 'u1'),
-            ('n_sum_hits', 'u4'),
+            ('n_hits', 'u4'),
             ('sample_range', 'u2', (2,)),
             ('hit_time_range', 'f4', (2,)),
             ('rising_spline_range', 'f4', (2,)),
@@ -73,6 +74,7 @@ class FlashFinder(H5FlowStage):
         cwvfm_dset = self.data_manager.get_dset(self.cwvfm_dset_name)
         self.sum_hits_dset = self.data_manager.get_dset(self.sum_hits_dset_name)
         self.sipm_hits_dset = self.data_manager.get_dset(self.sipm_hits_dset_name)
+        self.input_hits_dset = self.data_manager.get_dset(self.input_hits_dset_name)
 
         self.dbs = cluster.DBSCAN(eps=self.eps, min_samples=self.min_samples)
 
@@ -91,11 +93,11 @@ class FlashFinder(H5FlowStage):
         self.data_manager.create_dset(self.flash_dset_name,
                                       dtype=self.flash_dtype)
         self.data_manager.create_ref(source_name, self.flash_dset_name)
-        self.data_manager.create_ref(self.sum_hits_dset_name, self.flash_dset_name)
-        #self.data_manager.create_ref(self.sipm_hits_dset_name, self.flash_dset_name)
+        self.data_manager.create_ref(self.input_hits_dset_name, self.flash_dset_name)
         self.data_manager.set_attrs(self.flash_dset_name,
                                     classname=self.classname,
                                     class_version=self.class_version,
+                                    input_hits_dset=self.input_hits_dset_name,
                                     sum_hits_dset=self.sum_hits_dset_name,
                                     sipm_hits_dset=self.sipm_hits_dset_name
                                     )
@@ -127,36 +129,27 @@ class FlashFinder(H5FlowStage):
         events = cache[source_name]
         cwvfms = cache['light/cwvfm'].reshape(cache[source_name].shape)[
             'samples']
-        
-        #Get assosciate hits for events slice
-        sum_hit_ref_dset, sum_hit_ref_dir = self.data_manager.get_ref(source_name,self.sum_hits_dset_name)
-        sum_hit_ref_region = self.data_manager.get_ref_region(source_name,self.sum_hits_dset_name)
-        sipm_hit_ref_dset, sipm_hit_ref_dir = self.data_manager.get_ref(source_name,self.sipm_hits_dset_name)
-        sipm_hit_ref_region = self.data_manager.get_ref_region(source_name,self.sipm_hits_dset_name)
 
-        
+        # Get associated hits for events slice (use configurable input hits)
+        input_hit_ref_dset, input_hit_ref_dir = self.data_manager.get_ref(source_name, self.input_hits_dset_name)
+        input_hit_ref_region = self.data_manager.get_ref_region(source_name, self.input_hits_dset_name)
 
-        sum_hits_idx = dereference(source_slice, sum_hit_ref_dset, region=sum_hit_ref_region,
-                               ref_direction=sum_hit_ref_dir, indices_only=True)
-        sum_hits = dereference(source_slice, sum_hit_ref_dset, data=self.sum_hits_dset, region=sum_hit_ref_region,
-                               ref_direction=sum_hit_ref_dir)
-        sipm_hits_idx = dereference(source_slice, sipm_hit_ref_dset, region=sipm_hit_ref_region,
-                               ref_direction=sipm_hit_ref_dir, indices_only=True)
-        sipm_hits = dereference(source_slice, sipm_hit_ref_dset, data=self.sipm_hits_dset, region=sipm_hit_ref_region,
-                               ref_direction=sipm_hit_ref_dir)
+        input_hits_idx = dereference(source_slice, input_hit_ref_dset, region=input_hit_ref_region,
+                               ref_direction=input_hit_ref_dir, indices_only=True)
+        input_hits = dereference(source_slice, input_hit_ref_dset, data=self.input_hits_dset, region=input_hit_ref_region,
+                               ref_direction=input_hit_ref_dir)
 
         if VERBOSE: print("# events in slice: ",len(events))
         flash_list = []
         ev_ref_list = []
-        sum_ref_list = []
-        #sipm_ref_list = []
+        hit_ref_list = []
 
         for i, ev in enumerate(events):
             if VERBOSE: print("Event #",i)
             for itpc in range(self.ntpc):
-                tpc_mask = (sum_hits[i,:]["tpc"] == itpc)
-                tpc_hits = sum_hits[i,tpc_mask]
-                tpc_hits_idx = sum_hits_idx[i,tpc_mask]
+                tpc_mask = (input_hits[i,:]["tpc"] == itpc)
+                tpc_hits = input_hits[i,tpc_mask]
+                tpc_hits_idx = input_hits_idx[i,tpc_mask]
                 if np.any(tpc_mask):
                     labels = self.dbs.fit_predict(tpc_hits["sample_idx"].reshape(-1,1)) # single feature
 
@@ -167,21 +160,21 @@ class FlashFinder(H5FlowStage):
                     n_noise = np.count_nonzero(labels == -1)
                     tpc_flashes = np.empty((n_clusters+n_noise),dtype=self.flash_dtype)
                     ev_ref = np.empty((n_clusters+n_noise),dtype='u4') #ev ID for each flash
-                    sum_ref = np.empty((len(tpc_hits_idx),2),dtype='u4')
+                    hit_ref = np.empty((len(tpc_hits_idx),2),dtype='u4')
                     tpc_flashes["tpc"] = itpc
-                    
+
                     if VERBOSE:
                         print("    TPC #",itpc," #Clusters ",n_clusters)
-                        print("       #Hits    ",sum_hits[i,tpc_mask].shape)
-                        print("       Hits:    ",sum_hits[i,tpc_mask]["sample_idx"])
-                        print("       Hits IDs:    ",sum_hits[i,tpc_mask]["id"])
-                        print("       Hits IDs:    ",sum_hits_idx[i,tpc_mask])
+                        print("       #Hits    ",input_hits[i,tpc_mask].shape)
+                        print("       Hits:    ",input_hits[i,tpc_mask]["sample_idx"])
+                        print("       Hits IDs:    ",input_hits[i,tpc_mask]["id"])
+                        print("       Hits IDs:    ",input_hits_idx[i,tpc_mask])
                         print("       Labels:  ",labels)
 
                     #Handle clusters
                     # Note: Clusters pre-sorted in time by DBSCAN
                     for cl in range(n_clusters):
-                        tpc_flashes[cl]["n_sum_hits"] = np.count_nonzero(labels==cl)
+                        tpc_flashes[cl]["n_hits"] = np.count_nonzero(labels==cl)
 
                         #Timing information
                         tpc_flashes[cl]["sample_range"] = self.get_extrema(tpc_hits[labels==cl]["sample_idx"])
@@ -207,14 +200,14 @@ class FlashFinder(H5FlowStage):
 
                     # when it gets here, there must be at least one non-noisy clusters
                     ev_ref[:] = np.r_[source_slice][i]
-                    sum_ref[:,0] = tpc_hits_idx[labels>=0]
-                    sum_ref[:,1] = labels[labels>=0]
+                    hit_ref[:,0] = tpc_hits_idx[labels>=0]
+                    hit_ref[:,1] = labels[labels>=0]
 
                     flash_list.append(tpc_flashes)
                     ev_ref_list.append(ev_ref)
-                    sum_ref_list.append(sum_ref)
-       
-        if len(flash_list) and len(ev_ref_list) and len(sum_ref_list):
+                    hit_ref_list.append(hit_ref)
+
+        if len(flash_list) and len(ev_ref_list) and len(hit_ref_list):
             flash_data = np.concatenate(flash_list)
 
             # save data
@@ -232,9 +225,7 @@ class FlashFinder(H5FlowStage):
             flash_list_struc = [arr.shape[0] for arr in flash_list]
             flash_list = np.split(flash_data, np.cumsum(flash_list_struc)[:-1])
             for j, tpc_flash_slice in enumerate(flash_list):
-                sum_ref_list[j] = np.c_[sum_ref_list[j][:,0], tpc_flash_slice["id"][sum_ref_list[j][:,1]]]
-            ref_sum = np.concatenate(sum_ref_list)
+                hit_ref_list[j] = np.c_[hit_ref_list[j][:,0], tpc_flash_slice["id"][hit_ref_list[j][:,1]]]
+            ref_hit = np.concatenate(hit_ref_list)
             self.data_manager.write_ref(
-                self.sum_hits_dset_name, self.flash_dset_name, ref_sum)
-            #self.data_manager.write_ref(
-            #    self.sum_hits_dset_name, self.flash_dset_name, ref_sipm)
+                self.input_hits_dset_name, self.flash_dset_name, ref_hit)
