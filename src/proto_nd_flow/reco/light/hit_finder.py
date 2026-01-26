@@ -152,15 +152,29 @@ class WaveformHitFinder(H5FlowStage):
             raise RuntimeError(f'Invalid hit level {self.hit_level}')
 
 
-    # function to calculate the prompt light fraction in a vectorized way
     def extract_pulse_shape_disc(self, wvfm, peak_bins,
-                        prompt_window_ns, long_window_ns, tick_duration_ns):
+                                prompt_window_ns, long_window_ns,
+                                tick_duration_ns, tau_triplet_ns):
         """
         Calculates fprompt and integral for each peak, returning arrays shaped
         like the input waveforms with values placed at peak indices.
 
-        wvfm:   shape (..., n_samples)
-        peak_bins:     same shape, True at peak locations, False elsewhere
+        wvfm:           shape (..., n_samples)
+        peak_bins:      same shape, True at peak locations, False elsewhere
+        prompt_window_ns:  prompt integration window (fixed)
+        long_window_ns:    *maximum* long integration window (upper bound)
+        tick_duration_ns:  time per sample
+        tau_triplet_ns:    LAr triplet lifetime (for adaptive long window)
+
+        Long integration window per peak:
+            Δt_long = tau_triplet_ns * ln(max_amp)
+
+        with constraints (in bins):
+            prompt_window <= Δt_long <= long_window_ns
+
+        Additionally, if there is a *next* hit in the same waveform, the
+        long integration is cut short to 5 samples before that next peak:
+            end_total ≤ t0_next = s_next - min(5, s_next)
 
         Returns:
             integrals: array shaped like wvfm, with integral values at peak indices
@@ -168,12 +182,17 @@ class WaveformHitFinder(H5FlowStage):
         """
         # Validate input parameters
         if prompt_window_ns > long_window_ns:
-            raise ValueError(f"prompt_window_ns ({prompt_window_ns}) must be <= long_window_ns ({long_window_ns})")
+            raise ValueError(
+                f"prompt_window_ns ({prompt_window_ns}) must be <= long_window_ns ({long_window_ns})"
+            )
         if tick_duration_ns <= 0:
             raise ValueError(f"tick_duration_ns must be positive, got {tick_duration_ns}")
+        if tau_triplet_ns <= 0:
+            raise ValueError(f"tau_triplet_ns must be positive, got {tau_triplet_ns}")
 
         prompt_bins = int(np.ceil(prompt_window_ns / tick_duration_ns))
-        total_bins  = int(np.ceil(long_window_ns   / tick_duration_ns))
+        max_total_bins = int(np.ceil(long_window_ns / tick_duration_ns))
+
         n_samples = wvfm.shape[-1]
 
         # Find all peaks (hits)
@@ -182,30 +201,87 @@ class WaveformHitFinder(H5FlowStage):
             # No peaks, return zeros
             return np.zeros_like(wvfm, dtype=np.float32), np.zeros_like(wvfm, dtype=np.float32)
 
-        # Compute t0_bin for each peak
+        # Last axis indices (sample indices)
         s = peak_indices[-1]
+
+        # t0_bin: reference "start" bin (up to 5 samples before the peak)
         t0_bin = s - np.minimum(5, s)
         start_idx = np.clip(t0_bin, 0, n_samples)
+
+        # --- Adaptive long window (per-peak) from exponential model ---
+        # Peak amplitude at the peak bin; use abs in case pulses can be negative
+        peak_amps = np.abs(wvfm[peak_indices])
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # Δt_long (ns) from exponential reaching amplitude 1
+            # Δt_long = tau_triplet_ns * ln(max_amp), with max_amp >= 1
+            dt_long_ns = tau_triplet_ns * np.log(np.maximum(peak_amps, 1.0))
+
+        # Convert to bins and clip between prompt and maximum long window
+        adaptive_total_bins = np.ceil(dt_long_ns / tick_duration_ns).astype(int)
+        adaptive_total_bins = np.clip(adaptive_total_bins, prompt_bins, max_total_bins)
+
+        # Base end indices from lifetime / long_window_ns
+        end_total = t0_bin + adaptive_total_bins
+
+        # Compute prompt window end as before
         end_prompt = np.clip(t0_bin + prompt_bins, 0, n_samples)
-        end_total  = np.clip(t0_bin + total_bins,  0, n_samples)
+
+        # --- Cut long window if there is a following hit in the same waveform ---
+        base_indices = peak_indices[:-1]  # all axes except last
+        num_hits = len(s)
+        next_t0_limit = np.full(num_hits, n_samples, dtype=int)  # default: no cut
+
+        if num_hits > 1:
+            # Sort hits by (base_indices..., sample index)
+            if base_indices:
+                # lexsort uses last key as primary; we want sample index primary
+                keys = (s,) + base_indices[::-1]
+            else:
+                keys = (s,)
+            order = np.lexsort(keys)
+
+            # Traverse hits in sorted order to find "next hit in same waveform"
+            for k in range(1, num_hits):
+                prev = order[k - 1]
+                curr = order[k]
+
+                # Check if prev and curr are in the same waveform (same base indices)
+                same_base = True
+                for d, ax in enumerate(base_indices):
+                    if ax[prev] != ax[curr]:
+                        same_base = False
+                        break
+
+                if same_base:
+                    # t0_next is 5 samples before the following peak (or less near start)
+                    s_next = s[curr]
+                    t0_next = s_next - min(5, s_next)
+                    t0_next = max(t0_next, 0)
+                    next_t0_limit[prev] = t0_next
+
+        # Apply the "next hit" cut to the long-window end
+        end_total = np.minimum(end_total, next_t0_limit)
+        end_total = np.clip(end_total, 0, n_samples)
 
         # Prepare output arrays
         integrals = np.zeros_like(wvfm, dtype=np.float32)
         fprompts = np.zeros_like(wvfm, dtype=np.float32)
 
-        # Build all base indices (all axes except last)
-        base_indices = peak_indices[:-1]
         # Flatten base indices for advanced indexing
         flat_base = tuple(np.array(ax) for ax in base_indices)
 
-        # For each peak, sum over the prompt and total windows
         prompt_vals = []
         total_vals = []
-        for i in range(len(s)):
+
+        # Loop over peaks (vectorized indexing, loop only over hits)
+        for i in range(num_hits):
             idx = tuple(ax[i] for ax in flat_base)
-            p0, p1 = start_idx[i], end_prompt[i]
+            p0 = start_idx[i]
+            p1 = end_prompt[i]
             t1 = end_total[i]
-            # If the window is invalid (start >= end or prompt > total), set nan
+
+            # If the window is invalid, set NaN
             if p0 >= p1 or p0 >= t1 or p1 > t1:
                 prompt_vals.append(np.nan)
                 total_vals.append(np.nan)
@@ -219,15 +295,18 @@ class WaveformHitFinder(H5FlowStage):
         # Compute fprompt and assign to output arrays
         with np.errstate(divide='ignore', invalid='ignore'):
             fprompt_vals = np.where(
-                (total_vals > 0) & (prompt_vals > 0) & ~np.isnan(prompt_vals) & ~np.isnan(total_vals),
+                (total_vals > 0) & (prompt_vals > 0)
+                & ~np.isnan(prompt_vals) & ~np.isnan(total_vals),
                 prompt_vals / total_vals,
                 np.nan
             )
+
         # Place results at peak indices
         integrals[peak_indices] = total_vals
         fprompts[peak_indices] = fprompt_vals
 
         return integrals, fprompts
+
 
 
     # gets ToT for threshold crossing pairs of samples (incl hysterisis)
@@ -540,15 +619,18 @@ class WaveformHitFinder(H5FlowStage):
             peak_tot_upper = peak_tot_upper[threshold_mask]
             peak_integral = peak_integral[threshold_mask]
             peak_fprompt = peak_fprompt[threshold_mask]
+
             # get neighboring samples
             peak_sample_index = np.clip(peaks[-1].reshape(-1, 1)
                                         + np.arange(-self.near_samples + 1, self.near_samples + 2), 0, self.nsamples - 1)
             peak_samples = wvfms[peaks[:-1] + (peak_sample_index,)]
             peak_sum = np.sum(peak_samples, axis=-1)
+
             # create hit spline
             peak_spline = scipy.interpolate.CubicSpline(
                 np.arange(-self.near_samples, self.near_samples + 1),
                 peak_samples, axis=-1, extrapolate=True)
+
             # calculate integral
             peak_sum_spline = peak_spline.integrate(-self.near_samples,
                                                     self.near_samples)
@@ -570,8 +652,8 @@ class WaveformHitFinder(H5FlowStage):
                                                   mask=subsamples >= peak_ns_spline)
             rising_outlier_mask = self.find_outlier_mask(
                 peak_rising_spline_samples)
-            # calculate rising edge
 
+            # calculate rising edge
             peak_rising_spline_samples = ma.array(peak_rising_spline_samples,
                                                   mask=rising_outlier_mask)
             peak_rising_spline = ma.mean(peak_rising_spline_samples, axis=-1,
